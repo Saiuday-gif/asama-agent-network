@@ -1,11 +1,10 @@
-pyarrow<20.0.0>
 fastapi
 uvicorn
 sqlalchemy
 pydantic
-sentence-transformers
-scikit-learn
-groq
-streamlit
-requests
 python-dotenv
+groq
+requests
+streamlit
+sentence-transformers
+numpy
