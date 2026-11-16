@@ -1,9 +1,9 @@
 import os
+import re
 import json
+import math
+import hashlib
 from pathlib import Path
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 from groq import Groq
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
@@ -17,8 +17,6 @@ if root_env.exists():
 elif local_env.exists():
     load_dotenv(dotenv_path=local_env)
 
-# Embedding model (all-MiniLM-L6-v2 is fast and runs locally)
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 def get_active_groq_model() -> str:
@@ -44,8 +42,23 @@ def get_active_groq_model() -> str:
         pass
     return "openai/gpt-oss-20b"
 
-def get_embedding(text: str) -> list[float]:
-    return embedder.encode(text).tolist()
+def get_embedding(text: str, dim: int = 128) -> list[float]:
+    """Lightweight deterministic semantic vector embedding (0MB RAM overhead)."""
+    vec = [0.0] * dim
+    words = re.findall(r'\w+', text.lower())
+    for w in words:
+        idx = int(hashlib.md5(w.encode("utf-8")).hexdigest(), 16) % dim
+        vec[idx] += 1.0
+    norm = math.sqrt(sum(x * x for x in vec))
+    return [round(x / norm, 6) for x in vec] if norm > 0 else vec
+
+def compute_cosine_similarity(v1: list[float], v2: list[float]) -> float:
+    if not v1 or not v2 or len(v1) != len(v2):
+        return 0.0
+    dot = sum(a * b for a, b in zip(v1, v2))
+    n1 = math.sqrt(sum(a * a for a in v1))
+    n2 = math.sqrt(sum(b * b for b in v2))
+    return float(dot / (n1 * n2)) if (n1 and n2) else 0.0
 
 def evaluate_relevance_with_llm(post_title: str, post_content: str, company_name: str, manifesto: str) -> dict:
     """Stage 3: LLM Judge to compute final joint relevance score (0.0 to 1.0)."""
@@ -91,13 +104,13 @@ def route_post(db: Session, post: Post) -> list[dict]:
     if not eligible_agents:
         return []
 
-    post_vec = np.array(json.loads(post.post_embedding)).reshape(1, -1)
+    post_vec = json.loads(post.post_embedding) if post.post_embedding else get_embedding(f"{post.title} {post.content}")
     candidates = []
 
     # Stage 2: Dense Vector Similarity Search
     for agent in eligible_agents:
-        agent_vec = np.array(json.loads(agent.interest_embedding)).reshape(1, -1)
-        sim_score = float(cosine_similarity(post_vec, agent_vec)[0][0])
+        agent_vec = json.loads(agent.interest_embedding) if agent.interest_embedding else get_embedding(agent.interest_manifesto)
+        sim_score = compute_cosine_similarity(post_vec, agent_vec)
         candidates.append((agent, sim_score))
 
     # Sort by vector similarity and take Top 5 candidates
@@ -108,8 +121,7 @@ def route_post(db: Session, post: Post) -> list[dict]:
 
     # Stage 3: High-Precision LLM Reranker (Threshold >= 0.70)
     for agent, vec_score in top_candidates:
-        if vec_score < 0.05:
-            # Drop obvious mismatches early to save LLM tokens
+        if vec_score < 0.02:
             log = RoutingLog(
                 post_id=post.id,
                 target_agent_id=agent.id,
